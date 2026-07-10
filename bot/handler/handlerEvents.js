@@ -139,6 +139,30 @@ function createGetText2(langCode, pathCustomLang, prefix, command) {
 }
 
 module.exports = function (api, threadModel, userModel, dashBoardModel, globalModel, usersData, threadsData, dashBoardData, globalData) {
+	// —————— SEQUENTIAL TYPING INDICATOR QUEUE (per thread) —————— //
+	// api.sendTypingIndicator() calls are async and can resolve out of
+	// order over the network (e.g. a "false" sent slightly after a "true"
+	// can arrive at Facebook's servers before it, leaving typing stuck
+	// visually ON forever). Every ON/OFF call for a thread is routed
+	// through this queue so they are always dispatched strictly one
+	// after another, never overlapping.
+	const typingQueues = new Map();
+	function queueTypingIndicator(threadID, state) {
+		const prev = typingQueues.get(threadID) || Promise.resolve();
+		const next = prev
+			.catch(() => {})
+			.then(() => {
+				// autoStop: false is critical — without it, the fca library
+				// schedules its own "false" 10 seconds after every "true"
+				// call, which fights with our own refresh/off timing and
+				// causes the typing indicator to flicker or appear stuck.
+				const options = state ? { autoStop: false } : undefined;
+				return api.sendTypingIndicator(threadID, state, options).catch(() => {});
+			});
+		typingQueues.set(threadID, next);
+		return next;
+	}
+
 	return async function (event, message) {
 
 		const { utils, client, GoatBot } = global;
@@ -203,6 +227,20 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 			message.SyntaxError = async function () {
 				return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "commandSyntaxError", prefix, commandName));
 			};
+		}
+
+		// —————— SHARED TYPING HELPER (used for quick built-in replies) —————— //
+		// Shows typing for a short random delay before language/system replies
+		// that don't go through the main RUN COMMAND flow (e.g. command-not-found).
+		async function showTypingBrief() {
+			const typingConfig = config.typingIndicator || {};
+			if (typingConfig.enable === false || typeof api.sendTypingIndicator !== "function") return;
+			await queueTypingIndicator(threadID, true);
+			const minDelay = typingConfig.delayMin ?? 3000;
+			const maxDelay = typingConfig.delayMax ?? 4000;
+			const delayMs = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+			await new Promise(resolve => setTimeout(resolve, delayMs));
+			await queueTypingIndicator(threadID, false);
 		}
 
 		/*
@@ -272,8 +310,10 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 			if (isBannedOrOnlyAdmin(userData, threadData, senderID, threadID, isGroup, commandName, message, langCode))
 				return;
 				if (!command) {
-				if (!hideNotiMessage.commandNotFound && (!commandName || commandName.trim() === ""))
+				if (!hideNotiMessage.commandNotFound && (!commandName || commandName.trim() === "")) {
+					await showTypingBrief();
 					return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "prefixOnly", prefix));
+				}
 				if (!hideNotiMessage.commandNotFound && commandName) {
 					const input = commandName.toLowerCase();
 					const allCommands = Array.from(GoatBot.commands.keys());
@@ -292,6 +332,7 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 					scored.sort((a, b) => a.score - b.score);
 					const bestScore = scored[0].score;
 					const top = scored.filter(s => s.score <= bestScore + 1).slice(0, 3).map(s => `› ${prefix}${s.cmd}`);
+					await showTypingBrief();
 					return await message.reply(
 						utils.getText({ lang: langCode, head: "handlerEvents" }, "commandNotFoundSuggestion", top.join("\n"), prefix)
 					);
@@ -303,6 +344,7 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 
 			if (needRole > role) {
 				if (!hideNotiMessage.needRoleToUseCmd) {
+					await showTypingBrief();
 					if (needRole == 1)
 						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyAdmin", commandName));
 					else if (needRole == 2)
@@ -328,6 +370,51 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 			// ——————————————— RUN COMMAND ——————————————— //
 			const time = getTime("DD/MM/YYYY HH:mm:ss");
 			isUserCallCommand = true;
+
+			// —————— GLOBAL TYPING INDICATOR + DELAY —————— //
+			// Shows "typing..." from the moment a command is called until the
+			// command finishes replying. Skips commands that manage their own
+			// typing indicator by setting config.typingIndicator = false.
+			const typingConfig = config.typingIndicator || {};
+			const useGlobalTyping = typingConfig.enable !== false
+				&& command.config.typingIndicator !== false
+				&& typeof api.sendTypingIndicator === "function";
+			let typingActive = false;
+			let typingKeepAlive = null;
+			let typingWatchdog = null;
+			if (useGlobalTyping) {
+				try {
+					await queueTypingIndicator(threadID, true);
+					typingActive = true;
+					log.info("TYPING", `ON  | ${commandName} | thread=${threadID}`);
+				} catch {}
+
+				// Facebook's typing indicator auto-expires after a short time,
+				// so for slow/API-based commands we keep re-sending it every
+				// few seconds until the command actually finishes.
+				const refreshMs = typingConfig.refreshMs ?? 15000;
+				typingKeepAlive = setInterval(() => {
+					queueTypingIndicator(threadID, true);
+					log.info("TYPING", `REFRESH | ${commandName} | thread=${threadID}`);
+				}, refreshMs);
+
+				// Safety net: force typing off after a hard cap even if the
+				// command hangs or the finally block below is somehow skipped,
+				// so a stuck command can never leave typing on indefinitely.
+				const maxTypingMs = typingConfig.maxDurationMs ?? 90000;
+				typingWatchdog = setTimeout(async () => {
+					if (typingKeepAlive) clearInterval(typingKeepAlive);
+					await queueTypingIndicator(threadID, false);
+					log.info("TYPING", `WATCHDOG-OFF | ${commandName} | thread=${threadID}`);
+					typingActive = false;
+				}, maxTypingMs);
+
+				const minDelay = command.config.typingDelayMin ?? typingConfig.delayMin ?? 3000;
+				const maxDelay = command.config.typingDelayMax ?? typingConfig.delayMax ?? 4000;
+				const delayMs = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+				await new Promise(resolve => setTimeout(resolve, delayMs));
+			}
+
 			try {
 				// analytics command call
 				(async () => {
@@ -353,6 +440,14 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 			catch (err) {
 				log.err("CALL COMMAND", `An error occurred when calling the command ${commandName}`, err);
 				return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "errorOccurred", time, commandName, removeHomeDir(err.stack ? err.stack.split("\n").slice(0, 5).join("\n") : JSON.stringify(err, null, 2))));
+			}
+			finally {
+				if (typingKeepAlive) clearInterval(typingKeepAlive);
+				if (typingWatchdog) clearTimeout(typingWatchdog);
+				if (typingActive) {
+					await queueTypingIndicator(threadID, false);
+					log.info("TYPING", `OFF | ${commandName} | thread=${threadID}`);
+				}
 			}
 		}
 
@@ -389,8 +484,84 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 					};
 				}
 
+				// —————— TYPING INDICATOR FOR NO-PREFIX / onChat COMMANDS —————— //
+				// onChat runs on every message to let commands decide internally
+				// whether to respond (e.g. keyword-triggered commands like "fork").
+				// We can't blindly show typing before calling onChat (that would
+				// flash typing on every single message in the thread). Instead we
+				// lazily start typing only the moment the command actually tries
+				// to send a reply, by wrapping api.sendMessage / message.reply.
+				const typingConfig = config.typingIndicator || {};
+				const useGlobalTyping = typingConfig.enable !== false
+					&& command.config.typingIndicator !== false
+					&& typeof api.sendTypingIndicator === "function";
+
+				let typingStarted = false;
+				let typingInterval = null;
+				let typingWatchdog = null;
+
+				const startTyping = async () => {
+					if (typingStarted || !useGlobalTyping) return;
+					typingStarted = true;
+					await queueTypingIndicator(threadID, true);
+					log.info("TYPING", `ON  | onChat:${commandName} | thread=${threadID}`);
+					const refreshMs = typingConfig.refreshMs ?? 15000;
+					typingInterval = setInterval(() => {
+						queueTypingIndicator(threadID, true);
+					}, refreshMs);
+
+					// Safety net: no matter what happens to the send call this
+					// was triggered for (hangs, network stalls, unresolved
+					// promise), typing is force-stopped after this cap.
+					const maxTypingMs = typingConfig.maxDurationMs ?? 90000;
+					typingWatchdog = setTimeout(async () => {
+						if (typingInterval) clearInterval(typingInterval);
+						await queueTypingIndicator(threadID, false);
+						log.info("TYPING", `WATCHDOG-OFF | onChat:${commandName} | thread=${threadID}`);
+						typingStarted = false;
+					}, maxTypingMs);
+
+					const minDelay = typingConfig.delayMin ?? 3000;
+					const maxDelay = typingConfig.delayMax ?? 4000;
+					const delayMs = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+					await new Promise(resolve => setTimeout(resolve, delayMs));
+				};
+
+				const stopTyping = () => {
+					if (typingInterval) clearInterval(typingInterval);
+					if (typingWatchdog) clearTimeout(typingWatchdog);
+					if (typingStarted) {
+						queueTypingIndicator(threadID, false);
+						log.info("TYPING", `OFF | onChat:${commandName} | thread=${threadID}`);
+					}
+					typingStarted = false;
+				};
+
+				const wrappedApi = Object.create(api);
+				wrappedApi.sendMessage = function (...sendArgs) {
+					const sendPromise = (async () => {
+						await startTyping();
+						return api.sendMessage.apply(api, sendArgs);
+					})();
+					sendPromise.finally(stopTyping).catch(() => {});
+					return sendPromise;
+				};
+
+				const wrappedMessage = Object.create(message);
+				wrappedMessage.reply = function (...replyArgs) {
+					const replyPromise = (async () => {
+						await startTyping();
+						return message.reply.apply(message, replyArgs);
+					})();
+					replyPromise.finally(stopTyping).catch(() => {});
+					return replyPromise;
+				};
+				// ———————————————————————————————————————————————————————— //
+
 				command.onChat({
 					...parameters,
+					api: wrappedApi,
+					message: wrappedMessage,
 					isUserCallCommand,
 					args,
 					commandName,
